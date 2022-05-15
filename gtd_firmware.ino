@@ -1,3 +1,4 @@
+#include <hayesengine.h>
 #include <SoftwareSerial.h>
 #include <AltSoftSerial.h>
 #include <TinyGPS.h>
@@ -5,16 +6,11 @@
 
 #define RX 2
 #define TX 3
-#define PREFFERED_BAUDRATE 57600 
 #define BUFFER_SIZE 75
 #define GLOBAL_SS_BUFFERSIZE 64
-#define DEFAULT_RESPONSE_WAITTIME 500
+#define DEFAULT_RESPONSE_WAITTIME 100
+#define PREFFERED_BAUDRATE 57600
 
-
-static char global_rx_buffer[GLOBAL_SS_BUFFERSIZE];
-
-static void execute_at_command(const char *const cmd, unsigned short wait_time, char* const rx_buffer);
-static void establish_module_comms(void);
 static void smartdelay(unsigned long duration);
 static void wait_for_valid_gps_data(Stream *gps_ss, TinyGPS *gps_dev);
 static signed short check_for_expected_response(const char *const expected_response, const char* const rx_buffer);
@@ -24,50 +20,52 @@ static signed short check_readiness_transmission(const char* const buffer);
 SoftwareSerial sim5320_soft_serial = SoftwareSerial(RX, TX);
 AltSoftSerial gps_soft_serial;
 TinyGPS gps_dev;
-
+HayesEngine<SoftwareSerial> at_engine(sim5320_soft_serial);
 
 void setup()
-{  
+{ 
+  const uint32_t baudrates[3] = {4800, 115200, PREFFERED_BAUDRATE};
+  uint8_t setup_rx_buffer[GLOBAL_SS_BUFFERSIZE];
+
   Serial.begin(57600);
   while (!Serial);
 
   delay(2000);
-  
+
   // Initialize pheripherals
   sim5320_soft_serial.begin(4800);
   gps_soft_serial.begin(9600);
-  
+
   //flush system info given by gsm module at startup out of rx buffer
-  if(sim5320_soft_serial.overflow()){ 
-    while(sim5320_soft_serial.available())
-      sim5320_soft_serial.read();
+  while (sim5320_soft_serial.available()){
+    sim5320_soft_serial.read();
   }
-
-  establish_module_comms();
-
-  execute_at_command("ATE0", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
+  at_engine.setBuffer(setup_rx_buffer, GLOBAL_SS_BUFFERSIZE);
+  at_engine.establish_module_comms(baudrates, 3, PREFFERED_BAUDRATE);
+  at_engine.execute_at_command("ATE0", 100);
   
 //  execute_at_command("AT+CSQ", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
 //  execute_at_command("AT+CREG?", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
 //  execute_at_command("AT+CPSI?", 10, PSTR("OK"));
 //  execute_at_command("AT+CREG?", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
 
-  execute_at_command("AT+NETCLOSE", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
+  at_engine.execute_at_command("AT+NETCLOSE", DEFAULT_RESPONSE_WAITTIME);
   delay(5000);
   
   //Define socket PDP context. That means setting AP credentials and network layer protocols.
   //execute_at_command("AT+CGSOCKCONT=1,\"IP\",\"premium\"", 500,PSTR("OK"));
 
-  execute_at_command("AT+CSOCKSETPN=1", 100, global_rx_buffer); // Set active PDP context. AP credentials and selected network layer protocol are saved in memory.
+  at_engine.execute_at_command("AT+CSOCKSETPN=1", DEFAULT_RESPONSE_WAITTIME); // Set active PDP context. AP credentials and selected network layer protocol are saved in memory.
   delay(1000);
-  execute_at_command("AT+CIPMODE=0", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);  //Select TCP application mode. See AT command sheet for more info
+  at_engine.execute_at_command("AT+CIPMODE=0", DEFAULT_RESPONSE_WAITTIME);  //Select TCP application mode. See AT command sheet for more info
   delay(2000); 
-  execute_at_command("AT+NETOPEN", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer); //Reserve and open socket. 
+  at_engine.execute_at_command("AT+NETOPEN", DEFAULT_RESPONSE_WAITTIME); //Reserve and open socket. 
   delay(5000);
   
   //Establisch TCP connection in multisocked mode
-  execute_at_command("AT+CIPOPEN=0,\"TCP\",\"190.112.244.217\",49200", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
+  at_engine.execute_at_command("AT+CIPOPEN=0,\"TCP\",\"190.112.244.217\",49200", DEFAULT_RESPONSE_WAITTIME);
 
+ Serial.println("Waiting for gps..."); 
  wait_for_valid_gps_data(&gps_soft_serial, &gps_dev);
 }
 
@@ -79,6 +77,9 @@ void loop()
   long latitude, longitude, current_altitude; 
   unsigned long position_fix_age, time_fix_age, date, current_time, current_course, current_speed;
 
+  Serial.println("Valida GPS data received..."); 
+
+
   gps_dev.get_position(&latitude, &longitude, &position_fix_age);
   gps_dev.get_datetime(&date, &current_time, &time_fix_age);
   current_altitude = gps_dev.altitude();
@@ -89,10 +90,13 @@ void loop()
   date, current_time, current_course, current_speed);
 
   snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPSEND=0,%i", strlen(message));
-  execute_at_command(custom_at_cmd, DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
-  if(check_readiness_transmission(global_rx_buffer)){
+  at_engine.setBuffer(response, GLOBAL_SS_BUFFERSIZE);
+  at_engine.execute_at_command(custom_at_cmd, DEFAULT_RESPONSE_WAITTIME);
+
+  if(check_readiness_transmission(response)){
     Serial.println("Now sending message!");
     sim5320_soft_serial.print(message);
+    memset(response, 0, 75);  
     delay(5000);
     for(unsigned short t=0; sim5320_soft_serial.available(); t++){
       response[t] = sim5320_soft_serial.read();
@@ -106,59 +110,6 @@ void loop()
   smartdelay(10000, &gps_soft_serial, &gps_dev);
 }
 
-//execute AT command, fill global_rx_buffer with response
-static void execute_at_command(const char *const cmd, unsigned short wait_time, char* const rx_buffer)
-{
-  unsigned long previous_timestamp = millis();
-  unsigned short transmission_started = 0;
-  unsigned short counter = 0;
-    
-  sim5320_soft_serial.println(cmd);
-  while((millis() - previous_timestamp) < (unsigned long)wait_time){
-    if(sim5320_soft_serial.available()){
-      rx_buffer[counter++] = (char)sim5320_soft_serial.read();
-      delayMicroseconds(18);     
-    }
-  }
-
-  Serial.print("cmd:\t"); Serial.println(cmd);
-  Serial.print("buffer content=\t"); Serial.println(rx_buffer); //For debugging
-  if(sim5320_soft_serial.overflow()){
-    Serial.println("Overflow in Arduino rx software serial buffer.");  //For debugging. Needs to be replaced with actual handler for production code.
-  }
-  
-  memset(rx_buffer, 0, BUFFER_SIZE);
-}
-
-// Check if baudrate of GPS/GSM module equals that of Arduino. If not, set it to PREFFERED_BAUDRATE
-// Needs to sent AT+IPREX too as cmd.
-static void establish_module_comms(void)
-{
-  unsigned short response = 0;
-  const long baudrates[3] = {4800, 115200, PREFFERED_BAUDRATE};
-  char cmd[15] = {0};
-  const char* expected_response = "OK";
-  
-  for(int i = 0; i < sizeof(baudrates)/sizeof(baudrates[0]); i++){
-    sim5320_soft_serial.begin(baudrates[i]);
-    for(int j = 0; (j < 3) && response !=  1; j++){
-      execute_at_command("AT", DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
-      response = check_for_expected_response("OK", global_rx_buffer);
-    }
-    if(response == 1){
-      if(baudrates[i] != PREFFERED_BAUDRATE){
-        snprintf_P(cmd, sizeof(cmd), PSTR("AT+IPREX=%li"), PREFFERED_BAUDRATE);
-        execute_at_command(cmd, DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
-
-        snprintf_P(cmd, sizeof(cmd), PSTR("AT+IPR=%li"), PREFFERED_BAUDRATE);
-        execute_at_command(cmd, DEFAULT_RESPONSE_WAITTIME, global_rx_buffer);
-        
-        sim5320_soft_serial.begin(PREFFERED_BAUDRATE);            
-      }
-      break;
-    }
-  }
-}
 
 static void smartdelay(unsigned long ms, Stream *gps_ss_ptr, TinyGPS *gps_dev_ptr)
 {
