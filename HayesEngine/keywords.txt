@@ -1,0 +1,12 @@
+# Syntax Coloring Map For HayesEngine
+
+# Datatypes (KEYWORD1)
+HayesEngine KEYWORD1
+
+# Methods and Functions (KEYWORD2)
+execute_at_command  KEYWORD2
+establish_module_comms  KEYWORD2
+
+# Instances (KEYWORD2)
+
+# Constants (LITERAL1)
