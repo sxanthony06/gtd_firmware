@@ -20,12 +20,11 @@ static signed short check_readiness_transmission(const char* const buffer);
 SoftwareSerial sim5320_soft_serial = SoftwareSerial(RX, TX);
 AltSoftSerial gps_soft_serial;
 TinyGPS gps_dev;
-HayesEngine<SoftwareSerial> at_engine(sim5320_soft_serial);
+HayesEngine<SoftwareSerial> at_engine(sim5320_soft_serial, 64);
 
 void setup()
 { 
   const uint32_t baudrates[3] = {4800, 115200, PREFFERED_BAUDRATE};
-  uint8_t setup_rx_buffer[GLOBAL_SS_BUFFERSIZE];
 
   Serial.begin(57600);
   while (!Serial);
@@ -40,7 +39,6 @@ void setup()
   while (sim5320_soft_serial.available()){
     sim5320_soft_serial.read();
   }
-  at_engine.setBuffer(setup_rx_buffer, GLOBAL_SS_BUFFERSIZE);
   at_engine.establish_module_comms(baudrates, 3, PREFFERED_BAUDRATE);
   at_engine.execute_at_command("ATE0", 100);
   
@@ -89,8 +87,7 @@ void loop()
   snprintf(message, sizeof(message), "%li%li%li%lu%lu%lu%lu%lu%lu", latitude, longitude, current_altitude,position_fix_age, time_fix_age, 
   date, current_time, current_course, current_speed);
 
-  snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPSEND=0,%i", strlen(message));
-  at_engine.setBuffer(response, GLOBAL_SS_BUFFERSIZE);
+  snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPSEND=0,%i", strlen(message)); 
   at_engine.execute_at_command(custom_at_cmd, DEFAULT_RESPONSE_WAITTIME);
 
   if(check_readiness_transmission(response)){
