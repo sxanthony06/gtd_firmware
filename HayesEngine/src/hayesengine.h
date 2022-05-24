@@ -1,18 +1,20 @@
 #pragma once
-#include <SoftwareSerial.h>
+#include <HardwareSerial.h>
 
-template <class T> class HayesEngine {
+class HayesEngine {
     private:
-        T* _serial_dev = NULL;
-        uint8_t * _response_buffer = NULL;
-        uint8_t _buffer_size = 0;
+        HardwareSerial* serial_device = NULL;
+        uint8_t* buffer;
+        uint16_t buffer_size = 0;
     public:
-	HayesEngine(T& serial_dev);
-	HayesEngine(T& serial_dev, uint8_t *const buffer, uint8_t buf_size);
+	HayesEngine(HardwareSerial& serial_dev, uint16_t buffer_size);
         ~HayesEngine();
 
-        uint8_t execute_at_command(const char *const cmd, uint8_t wait_time);
-        inline uint8_t execute_at_command_part(const char *const cmd, uint8_t wait_time);
+        uint8_t execute_at_command(const char *const cmd, uint32_t wait_time);
+
         uint8_t establish_module_comms(const uint32_t* baudrates, uint8_t amount_possible_rates, uint32_t preffered_baudrate);
-        void setBuffer(uint8_t *const buffer, uint8_t buf_size);
+        bool set_buffer_size(uint16_t size);
+        size_t pipe_raw_input(uint8_t* buf, size_t s);
+        const uint8_t *const get_buffer_content(void);
+        
 };
