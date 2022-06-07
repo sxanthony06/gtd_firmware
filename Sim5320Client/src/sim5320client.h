@@ -1,7 +1,7 @@
 #pragma once
 
 #include <hayesengine.h>
-#include "Client.h"
+#include <Client.h>
 #include <IPAddress.h>
 #include <HardwareSerial.h>
 
@@ -9,13 +9,11 @@ class Sim5320Client : public Client {
 
 private:
 	HayesEngine* _at_engine;
-	uint16_t _timeout;
     	bool _pin_ready = false;
-    	bool _network_registered = false;
     	bool _initialized = false;
 
 public:
-	Sim5320Client(HayesEngine& engine, uint16_t timeout);
+	Sim5320Client(HayesEngine& engine);
 	~Sim5320Client();
 
 	void init(void);
@@ -33,7 +31,9 @@ public:
 	virtual void flush();
 	virtual void stop();
 	virtual uint8_t connected();
-	uint8_t net_open();
+	uint8_t is_net_open();
+	uint8_t open_net();
+	uint8_t close_net();
 	virtual operator bool();
 
 };
