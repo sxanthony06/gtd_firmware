@@ -1,149 +1,197 @@
+#include <TimeLib.h>
+#include <SD.h>
+#include <TinyGPS++.h>
+#include <PubSubClient.h>
+#include <IPAddress.h>
+#include <sim5320client.h>
 #include <hayesengine.h>
-#include <SoftwareSerial.h>
-#include <AltSoftSerial.h>
-#include <TinyGPS.h>
 #include <string.h>
 
-#define RX 2
-#define TX 3
-#define BUFFER_SIZE 75
-#define GLOBAL_SS_BUFFERSIZE 64
-#define DEFAULT_RESPONSE_WAITTIME 100
+#define CLIENT_INTERNAL_BUFFER_SIZE 275
+#define SERIAL_RX_BUFFER_SIZE 128
+#define INFLUXDB_LP_BUFFER_SIZE 275
+
+//#define DUMP_AT_COMMANDS
+#define DEBUG_SERIAL_COM Serial
+#define GSM_SERIAL_COM Serial1
+#define GPS_SERIAL_COM Serial2
+
+#define MQTT_KEEPALIVE_TIME 300
+#define MQTT_SOCKETTIMEOUT 60
+
 #define PREFFERED_BAUDRATE 57600
 
-static void smartdelay(unsigned long duration);
-static void wait_for_valid_gps_data(Stream *gps_ss, TinyGPS *gps_dev);
-static signed short check_for_expected_response(const char *const expected_response, const char* const rx_buffer);
-static signed short check_readiness_transmission(const char* const buffer);
+#define mqtt_broker_address "190.112.244.217"
+
+#define TRACKER_ID "000001"
+#define VIN "JH4KA3230J0018805"
+#define FW_TAG "0.0.1"
+#define HW_CONF_TAG "0.0.1"
+
+void smartdelay(unsigned long duration);
+void wait_for_valid_gps_data(HardwareSerial *gps_serial_com, TinyGPSPlus *gps_client);
+uint32_t get_unix_timestamp(HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr);
+void set_device_id(uint8_t *const _device_id, size_t size_device_id);
+
+#ifdef DUMP_AT_COMMANDS
+  #include <StreamDebugger.h>
+  StreamDebugger debugger(GSM_SERIAL_COM, DEBUG_SERIAL_COM);
+  HayesEngine at_engine(debugger, CLIENT_INTERNAL_BUFFER_SIZE);
+#else
+  HayesEngine at_engine(GSM_SERIAL_COM, CLIENT_INTERNAL_BUFFER_SIZE);
+#endif
+TinyGPSPlus gps_client;
+Sim5320Client sim_client(at_engine);
+PubSubClient mqtt_client(sim_client);
+TinyGPSCustom _fix_age(gps_client, "GPGSA", 2); // $GPGSA sentence, 2th element
+TinyGPSCustom pdop(gps_client, "GPGSA", 15); // $GPGSA sentence, 15th element
+TinyGPSCustom vdop(gps_client, "GPGSA", 17); // $GPGSA sentence, 16th element
+uint32_t lastReconnectAttempt = 0;
+uint32_t start_loop = 0;
+unsigned char device_id[16] = {0};
 
 
-SoftwareSerial sim5320_soft_serial = SoftwareSerial(RX, TX);
-AltSoftSerial gps_soft_serial;
-TinyGPS gps_dev;
-HayesEngine<SoftwareSerial> at_engine(sim5320_soft_serial, 64);
+void setup(){ 
+  const uint32_t baudrates[4] = {4800, 9600, 115200, PREFFERED_BAUDRATE};
 
-void setup()
-{ 
-  const uint32_t baudrates[3] = {4800, 115200, PREFFERED_BAUDRATE};
-
-  Serial.begin(57600);
-  while (!Serial);
-
-  delay(2000);
-
-  // Initialize pheripherals
-  sim5320_soft_serial.begin(4800);
-  gps_soft_serial.begin(9600);
-
-  //flush system info given by gsm module at startup out of rx buffer
-  while (sim5320_soft_serial.available()){
-    sim5320_soft_serial.read();
+/*  Initialize GSM, GPS pheripherals */   
+  GSM_SERIAL_COM.begin(4800);
+  GPS_SERIAL_COM.begin(9600);
+#ifdef DEBUG_MODE
+  DEBUG_SERIAL_COM.begin(57600);
+  while (!DEBUG_SERIAL_COM);
+#endif
+  delay(5000);
+//flush system info given by GSM module at startup out of rx buffer
+  while (GSM_SERIAL_COM.available()){
+    GSM_SERIAL_COM.read();
   }
-  at_engine.establish_module_comms(baudrates, 3, PREFFERED_BAUDRATE);
-  at_engine.execute_at_command("ATE0", 100);
-  
-//  execute_at_command("AT+CSQ", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
-//  execute_at_command("AT+CREG?", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
-//  execute_at_command("AT+CPSI?", 10, PSTR("OK"));
-//  execute_at_command("AT+CREG?", DEFAULT_RESPONSE_WAITTIME, PSTR("OK"));
+  at_engine.establish_module_comms(baudrates, 4, PREFFERED_BAUDRATE);
+  at_engine.execute_at_command("ATE0", 100);  
 
-  at_engine.execute_at_command("AT+NETCLOSE", DEFAULT_RESPONSE_WAITTIME);
-  delay(5000);
+ #ifdef DEBUG_MODE
+  DEBUG_SERIAL_COM.println("Waiting for valid gps data..."); 
+#endif
   
-  //Define socket PDP context. That means setting AP credentials and network layer protocols.
-  //execute_at_command("AT+CGSOCKCONT=1,\"IP\",\"premium\"", 500,PSTR("OK"));
-
-  at_engine.execute_at_command("AT+CSOCKSETPN=1", DEFAULT_RESPONSE_WAITTIME); // Set active PDP context. AP credentials and selected network layer protocol are saved in memory.
-  delay(1000);
-  at_engine.execute_at_command("AT+CIPMODE=0", DEFAULT_RESPONSE_WAITTIME);  //Select TCP application mode. See AT command sheet for more info
-  delay(2000); 
-  at_engine.execute_at_command("AT+NETOPEN", DEFAULT_RESPONSE_WAITTIME); //Reserve and open socket. 
-  delay(5000);
+  wait_for_valid_gps_data(&GPS_SERIAL_COM, &gps_client);
   
-  //Establisch TCP connection in multisocked mode
-  at_engine.execute_at_command("AT+CIPOPEN=0,\"TCP\",\"190.112.244.217\",49200", DEFAULT_RESPONSE_WAITTIME);
+  sim_client.init();
+  mqtt_client.setServer(mqtt_broker_address, 1883);
+  mqtt_client.setCallback(callback);
+  mqtt_client.setKeepAlive(180);
+  mqtt_client.setSocketTimeout(75);
 
- Serial.println("Waiting for gps..."); 
- wait_for_valid_gps_data(&gps_soft_serial, &gps_dev);
+  reconnect();
 }
 
-void loop()
-{
-  char message[75] = {0};
-  char response[75] = {0};
-  char custom_at_cmd[20] = {0};
-  long latitude, longitude, current_altitude; 
-  unsigned long position_fix_age, time_fix_age, date, current_time, current_course, current_speed;
+void loop(){
+  unsigned char message[INFLUXDB_LP_BUFFER_SIZE] = {0};
+  unsigned char custom_at_cmd[20] = {0};
 
-  Serial.println("Valida GPS data received..."); 
-
-
-  gps_dev.get_position(&latitude, &longitude, &position_fix_age);
-  gps_dev.get_datetime(&date, &current_time, &time_fix_age);
-  current_altitude = gps_dev.altitude();
-  current_speed = gps_dev.speed();
-  current_course = gps_dev.course();
+  uint32_t current_timestamp = 0;
   
-  snprintf(message, sizeof(message), "%li%li%li%lu%lu%lu%lu%lu%lu", latitude, longitude, current_altitude,position_fix_age, time_fix_age, 
-  date, current_time, current_course, current_speed);
+  uint8_t _sats;
+  float _pdop;
+  float _hdop;
+  float _vdop;
+  float _lat;
+  float _lng;
+  uint16_t _dir;
+  uint8_t _speed;
+  uint16_t _alt;
+  uint16_t _fix_age;
+  uint32_t _unix_timestamp;
 
-  snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPSEND=0,%i", strlen(message)); 
-  at_engine.execute_at_command(custom_at_cmd, DEFAULT_RESPONSE_WAITTIME);
-
-  if(check_readiness_transmission(response)){
-    Serial.println("Now sending message!");
-    sim5320_soft_serial.print(message);
-    memset(response, 0, 75);  
-    delay(5000);
-    for(unsigned short t=0; sim5320_soft_serial.available(); t++){
-      response[t] = sim5320_soft_serial.read();
+  start_loop = millis();
+  
+  if (!mqtt_client.connected()) {
+    uint32_t current_timestamp = millis();
+    if (current_timestamp - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = current_timestamp;
+      reconnect();
     }
-    Serial.print("Start Rcvd:\t"); Serial.println(response);
-    Serial.println("End Rcvd");
+  } else {
+    mqtt_client.loop();
+    DEBUG_SERIAL_COM.println("Valid GPS data received..."); 
+
+    _sats = gps_client.satellites.value();
+    _hdop = gps_client.hdop.hdop();
+    _lat = gps_client.location.lat();
+    _lng = gps_client.location.lng();
+    _dir = gps_client.course.deg();
+    _speed = gps_client.speed.kmph();
+    _alt = gps_client.altitude.meters();
+    _fix_age = gps_client.location.age();
+    _unix_timestamp =  get_unix_timestamp(&GPS_SERIAL_COM, &gps_client);
+    snprintf_P((char*)message, sizeof(message), PSTR("tracker_gps_telemetry,tracker_id=%s,vin=%s,fw_tag=%s,hw_conf_tag=%s "
+    "sats=%u,pdop=%s,hdop=%.2f,vdop=%s,lat=%2.6f,lng=%2.6f,dir=%hu,speed=%u,alt=%hu,fix_age=%hu %lu000000000"), TRACKER_ID,
+    VIN, FW_TAG, HW_CONF_TAG,_sats,pdop.value(),_hdop,vdop.value(),_lat,_lng,_dir,_speed,_alt,_fix_age,_unix_timestamp);
+    
+    DEBUG_SERIAL_COM.print("GPS data: ");DEBUG_SERIAL_COM.println((char*)message); 
+    
+    smartdelay(5000, &GPS_SERIAL_COM, &gps_client);
   }
-  
-  if(gps_soft_serial.overflow())
-    gps_soft_serial.flushInput();  
-  smartdelay(10000, &gps_soft_serial, &gps_dev);
 }
 
 
-static void smartdelay(unsigned long ms, Stream *gps_ss_ptr, TinyGPS *gps_dev_ptr)
-{
+void smartdelay(unsigned long ms, HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr){
   unsigned long time_now = millis();
   do 
   {
-    while (gps_ss_ptr->available())
-      gps_dev_ptr->encode(gps_ss_ptr->read());
+    while (gps_serial_com_ptr->available())
+      gps_client_ptr->encode(gps_serial_com_ptr->read());
   } while (millis() - time_now < ms);
 }
 
-static void wait_for_valid_gps_data(Stream *gps_ss_ptr, TinyGPS *gps_dev_ptr)
-{
+void wait_for_valid_gps_data(HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr){
   bool  valid_sentence = false;
   
   do{
-    if(gps_ss_ptr->available())
-      valid_sentence = gps_dev_ptr->encode(gps_ss_ptr->read());
+    if(gps_serial_com_ptr->available())
+      valid_sentence = gps_client_ptr->encode(gps_serial_com_ptr->read());
   }while(!valid_sentence);
 }
 
-static signed short check_for_expected_response(const char *const expected_response, const char* const rx_buffer)
-{
-  signed short ret;
-  
-  ret = strstr(rx_buffer, "OK") != NULL ? 1 : 0;
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i=0;i<length;i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
 }
 
-static signed short check_readiness_transmission(const char* const rx_buffer)
-{
-  signed short ret;
-
-  if(strstr(rx_buffer, ">") != NULL){
-    ret = 1;
-  }else {
-    ret = 0;
+void reconnect() {  
+  // Loop until we're reconnected
+  while (!mqtt_client.connected()) {
+    DEBUG_SERIAL_COM.println("Attempting MQTT connection...");
+    // Attempt to connect
+    if (mqtt_client.connect((const char*)device_id, "mqttclient", "Kf6F2LesMAdmkP2P")) {
+      DEBUG_SERIAL_COM.println("connected");
+      //mqtt_client.subscribe("$SYS/broker/subscriptions/count");
+    } else {
+      DEBUG_SERIAL_COM.print("failed, rc=");
+      DEBUG_SERIAL_COM.print(mqtt_client.state());
+      DEBUG_SERIAL_COM.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
   }
-  Serial.print("Readiness is:\t"); Serial.println(ret); Serial.println();
-  return ret; 
+}
+
+void set_device_id(uint8_t *const _device_id, size_t size_device_id){
+  unsigned char *token;
+  at_engine.execute_at_command("AT+CGSN",100);
+  token = strtok((char*)at_engine.get_buffer_content(), "\r\n");
+  strncpy((char*)_device_id, (const char*)token, size_device_id);
+}
+
+uint32_t get_unix_timestamp(HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr){
+  if(gps_client_ptr->time.isValid() && gps_client_ptr->time.age() < 1000 && gps_client_ptr->date.isValid() && gps_client_ptr->date.age() < 1000){
+    setTime(gps_client_ptr->time.hour(),gps_client_ptr->time.minute(),gps_client_ptr->time.second(),gps_client_ptr->date.day(),gps_client_ptr->date.month(),gps_client_ptr->date.year());
+    adjustTime(0 * SECS_PER_HOUR);
+    return now();
+  }
+  return 0;
 }
