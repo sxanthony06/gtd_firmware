@@ -46,30 +46,30 @@ void Sim5320Client::init(void){
 
 
 int Sim5320Client::connect(IPAddress ip, uint16_t port){
-    uint8_t raw_ip_string[16] = {0};
-    snprintf((char*)raw_ip_string, sizeof(raw_ip_string), "%hu.%hu.%hu.%hu", ip[0], ip[1], ip[2], ip[3]);
+    char raw_ip_string[16] = {0};
+    snprintf(raw_ip_string, sizeof(raw_ip_string), "%hu.%hu.%hu.%hu", ip[0], ip[1], ip[2], ip[3]);
     return connect((const char *)raw_ip_string, port);
 }
 
 int Sim5320Client::connect(const char* host, uint16_t port){
-	uint8_t custom_at_cmd[70] = {0};
+	char custom_at_cmd[70] = {0};
 	
 	if(!is_net_open()){
 		if(!open_net())
 			return 0;	
 	}
-	snprintf((char*)custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%hu", host, port);
+	snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%hu", host, port);
 	_at_engine->execute_at_command((const char*)custom_at_cmd, 5000);
 	return connected();
 }
 
 size_t Sim5320Client::write(uint8_t b){
-  return write(&b, (size_t)1); //porta e mester ta &b i no djis b.
+  return write(&b, (size_t)1);
 }
 
 size_t Sim5320Client::write(const uint8_t *buf, size_t s){
 	char custom_at_cmd[75] = {0};
-	uint16_t amount_bytes_written = 0;
+	size_t amount_bytes_written = 0;
 	
 	//Serial.print("amount of bytes to write: "); Serial.println(s);
 
@@ -77,11 +77,7 @@ size_t Sim5320Client::write(const uint8_t *buf, size_t s){
 	_at_engine->execute_at_command((const char*)custom_at_cmd, 100);
 	if(strstr((const char*)_at_engine->get_buffer_content(), ">") != NULL){
 		amount_bytes_written = _at_engine->pipe_raw_input(buf, s, 2000);
-		do{
-			if(strstr((const char*)_at_engine->get_buffer_content(), "+CIPSEND:") != NULL)
-				break;
-			_at_engine->read_cmd_response(1000);
-		}while(1);
+
 		Serial.print("amount of bytes written: "); Serial.println(amount_bytes_written);
 		return amount_bytes_written;
 	}else {

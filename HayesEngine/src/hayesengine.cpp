@@ -12,7 +12,7 @@
     free(this->buffer);
 }
 
- void HayesEngine::execute_at_command(const char *const cmd, uint32_t wait_time)
+ void HayesEngine::execute_at_command(const char *const cmd, uint16_t wait_time)
 {	
 	memset(this->buffer, 0, (size_t)this->buffer_size);	
 	serial_device->println(cmd);
@@ -78,24 +78,24 @@ bool HayesEngine::set_buffer_size(uint16_t size){
     return (this->buffer != NULL);
 }
 
-size_t HayesEngine::pipe_raw_input(uint8_t* buf, size_t s, uint32_t wait_time){
-	size_t amount_bytes_written = 0;
-	
+size_t HayesEngine::pipe_raw_input(uint8_t* buf, size_t s, uint16_t wait_time){
+	size_t amount_bytes_written = 0;	
 	memset(this->buffer, 0, (size_t)this->buffer_size);
+	
 	amount_bytes_written = serial_device->write(buf,s);
 	read_cmd_response(wait_time);
 	
 	return amount_bytes_written;
 }
 	
-size_t HayesEngine::read_cmd_response(uint32_t wait_time){	
+size_t HayesEngine::read_cmd_response(uint16_t wait_time){	
 	size_t counter = 0;
 	uint32_t previous_timestamp = millis();
 		
 	do{
 		while(serial_device->available()){
 			buffer[counter++] = serial_device->read();
-			delayMicroseconds((this->yield_duration_in_us)*10);
+			delayMicroseconds((this->yield_duration_in_us)*YIELD_DURATION_MULTIPLIER);
 		}
 		if(counter > 0)
 			break;
@@ -104,6 +104,42 @@ size_t HayesEngine::read_cmd_response(uint32_t wait_time){
 	return counter;
 }
 
+size_t HayesEngine::read_response_raw_input(uint16_t wait_time, uint8_t attempts){
+	uint16_t counter = 0;
+	uint32_t previous_timestamp = millis();
+    char *token;
+	size_t amount_bytes_written = 0;
+	bool response_found = false;
+    
+	for(uint8_t i = 0; i < attempts || response_found == true; i++){
+		do{
+			while(serial_device->available()){
+				buffer[counter++] = serial_device->read();
+				delayMicroseconds((this->yield_duration_in_us)*10);
+			}
+		}while((millis() - previous_timestamp) < (uint32_t)wait_time);
+		token = strchr(s, '+');
+		if(token != NULL){
+			token = strtok(token, "+CIPSEND:");
+			if(token != NULL){
+				token = strtok(token, ",");
+				if(token != NULL){
+					token = strtok(NULL, ",");
+					if(token != NULL){
+						token = strtok(NULL, "\r\n");
+						if(token != NULL){
+							amount_bytes_written = atoi((const char*)token);
+							Serial.print("amount bytes written after pipe_raw_input(): "); Serial.println(amount_bytes_written);
+							response_found = true;
+						}
+					}	
+				}	
+			}
+		}
+	}
+	return amount_bytes_written;
+}
+
  const uint8_t *const HayesEngine::get_buffer_content(void){
-  return (const uint8_t *const)buffer; 
+  return (const char *const)buffer; 
 }
