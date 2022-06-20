@@ -49,7 +49,7 @@
 
 #define TRACKER_ID "000001"
 #define VIN "JH4KA3230J0018805"
-#define FW_TAG "0.0.1"
+#define FW_TAG "1.0.0"
 #define HW_CONF_TAG "0.0.1"
 
 void smartdelay(unsigned long duration);
