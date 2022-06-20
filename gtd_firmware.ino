@@ -7,9 +7,31 @@
 #include <hayesengine.h>
 #include <string.h>
 
-#define CLIENT_INTERNAL_BUFFER_SIZE 275
-#define SERIAL_RX_BUFFER_SIZE 128
-#define INFLUXDB_LP_BUFFER_SIZE 275
+#define CLIENT_INTERNAL_BUFFER_SIZE 512
+#define DEFAULT_CHAR_INTERVAL 100
+//#define SERIAL_RX_BUFFER_SIZE 128
+
+#define INFLUXDB_LP_BUFFER_SIZE 512
+
+#define LP_LOCATION_FLOAT_PRECISION 6
+#define LP_LOCATION_FLOAT_MIN_WIDTH 9
+#define LP_LOCATION_FLOAT_BUF_SIZE 12
+
+#define LP_HDOP_FLOAT_PRECISION 2
+#define LP_HDOP_FLOAT_MIN_WIDTH 3
+#define LP_HDOP_FLOAT_BUF_SIZE 6
+
+#define LP_SPEED_FLOAT_PRECISION 2
+#define LP_SPEED_FLOAT_MIN_WIDTH 3
+#define LP_SPEED_FLOAT_BUF_SIZE 6
+
+#define LP_COURSE_FLOAT_PRECISION 1
+#define LP_COURSE_FLOAT_MIN_WIDTH 3
+#define LP_COURSE_FLOAT_BUF_SIZE 6
+
+#define LP_ALTITUDE_FLOAT_PRECISION 0
+#define LP_ALTITUDE_FLOAT_MIN_WIDTH 2
+#define LP_ALTITUDE_FLOAT_BUF_SIZE 6
 
 //#define DUMP_AT_COMMANDS
 #define DEBUG_SERIAL_COM Serial
@@ -19,7 +41,9 @@
 #define MQTT_KEEPALIVE_TIME 300
 #define MQTT_SOCKETTIMEOUT 60
 
-#define PREFFERED_BAUDRATE 57600
+#define MQTT_CLIENT_RECONNECT_INTERVAL 3000
+
+#define PREFFERED_BAUDRATE 9600
 
 #define mqtt_broker_address "190.112.244.217"
 
@@ -33,114 +57,109 @@ void wait_for_valid_gps_data(HardwareSerial *gps_serial_com, TinyGPSPlus *gps_cl
 uint32_t get_unix_timestamp(HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr);
 void set_device_id(uint8_t *const _device_id, size_t size_device_id);
 
-#ifdef DUMP_AT_COMMANDS
-  #include <StreamDebugger.h>
-  StreamDebugger debugger(GSM_SERIAL_COM, DEBUG_SERIAL_COM);
-  HayesEngine at_engine(debugger, CLIENT_INTERNAL_BUFFER_SIZE);
-#else
-  HayesEngine at_engine(GSM_SERIAL_COM, CLIENT_INTERNAL_BUFFER_SIZE);
-#endif
+//#ifdef DUMP_AT_COMMANDS
+//  #include <StreamDebugger.h>
+//  StreamDebugger debugger(GSM_SERIAL_COM, DEBUG_SERIAL_COM);
+//  HayesEngine at_engine((HardwareSerial&)debugger, CLIENT_INTERNAL_BUFFER_SIZE, DEFAULT_CHAR_INTERVAL);
+//#else
+//  HayesEngine at_engine(GSM_SERIAL_COM, CLIENT_INTERNAL_BUFFER_SIZE, DEFAULT_CHAR_INTERVAL);
+//#endif
+
+HayesEngine at_engine(GSM_SERIAL_COM, CLIENT_INTERNAL_BUFFER_SIZE, DEFAULT_CHAR_INTERVAL);
+
 TinyGPSPlus gps_client;
 Sim5320Client sim_client(at_engine);
 PubSubClient mqtt_client(sim_client);
 TinyGPSCustom _fix_age(gps_client, "GPGSA", 2); // $GPGSA sentence, 2th element
 TinyGPSCustom pdop(gps_client, "GPGSA", 15); // $GPGSA sentence, 15th element
 TinyGPSCustom vdop(gps_client, "GPGSA", 17); // $GPGSA sentence, 16th element
-uint32_t lastReconnectAttempt = 0;
-uint32_t start_loop = 0;
-unsigned char device_id[16] = {0};
 
+uint32_t last_reconnect_attempt = 0;
+uint32_t last_published_attempt = 0;
+
+uint32_t time_before_loop = 0;
+uint32_t time_after_loop = 0;
+
+char device_id[16] = {0};
+char influx_lp[INFLUXDB_LP_BUFFER_SIZE] = {0};
 
 void setup(){ 
-  const uint32_t baudrates[4] = {4800, 9600, 115200, PREFFERED_BAUDRATE};
+  const uint32_t baudrates[4] = {4800, 57600, 115200, PREFFERED_BAUDRATE};
 
 /*  Initialize GSM, GPS pheripherals */   
   GSM_SERIAL_COM.begin(4800);
   GPS_SERIAL_COM.begin(9600);
-#ifdef DEBUG_MODE
   DEBUG_SERIAL_COM.begin(57600);
   while (!DEBUG_SERIAL_COM);
-#endif
+  
   delay(5000);
-//flush system info given by GSM module at startup out of rx buffer
+  //flush system info given by GSM module at startup out of rx buffer
   while (GSM_SERIAL_COM.available()){
     GSM_SERIAL_COM.read();
   }
   at_engine.establish_module_comms(baudrates, 4, PREFFERED_BAUDRATE);
-  at_engine.execute_at_command("ATE0", 100);  
+  at_engine.execute_at_command("ATE0");  
 
- #ifdef DEBUG_MODE
   DEBUG_SERIAL_COM.println("Waiting for valid gps data..."); 
-#endif
   
   wait_for_valid_gps_data(&GPS_SERIAL_COM, &gps_client);
   
   sim_client.init();
   mqtt_client.setServer(mqtt_broker_address, 1883);
   mqtt_client.setCallback(callback);
-  mqtt_client.setKeepAlive(180);
-  mqtt_client.setSocketTimeout(75);
-
-  reconnect();
+  mqtt_client.setKeepAlive(120);
+  mqtt_client.setSocketTimeout(30);
 }
 
 void loop(){
-  unsigned char message[INFLUXDB_LP_BUFFER_SIZE] = {0};
-  unsigned char custom_at_cmd[20] = {0};
-
-  uint32_t current_timestamp = 0;
+  uint8_t _sats = 0;
+  float _pdop = 0, _vdop = 0;
+  char _lat[LP_LOCATION_FLOAT_BUF_SIZE] = {0}, _lng[LP_LOCATION_FLOAT_BUF_SIZE] = {0};
+  char _hdop[LP_LOCATION_FLOAT_BUF_SIZE] = {0};
+  char _speed[LP_SPEED_FLOAT_BUF_SIZE] = {0};
+  char _course[LP_COURSE_FLOAT_BUF_SIZE] = {0};
+  char _alt[LP_ALTITUDE_FLOAT_BUF_SIZE] = {0};
+  uint32_t _fix_age = 0, _unix_timestamp = 0;
   
-  uint8_t _sats;
-  float _pdop;
-  float _hdop;
-  float _vdop;
-  float _lat;
-  float _lng;
-  uint16_t _dir;
-  uint8_t _speed;
-  uint16_t _alt;
-  uint16_t _fix_age;
-  uint32_t _unix_timestamp;
+  if(GPS_SERIAL_COM.available())
+      gps_client.encode(GPS_SERIAL_COM.read());
 
-  start_loop = millis();
+  reconnect();
   
-  if (!mqtt_client.connected()) {
-    uint32_t current_timestamp = millis();
-    if (current_timestamp - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = current_timestamp;
-      reconnect();
+  if(millis() - last_published_attempt > 9000){
+    memset(influx_lp, '\0', sizeof(influx_lp));
+    smartdelay(1000, &GPS_SERIAL_COM, &gps_client); 
+
+    if(gps_client.location.isValid() && gps_client.location.age() < 1000){
+      _sats = gps_client.satellites.value();
+      dtostrf(gps_client.location.lat(),LP_LOCATION_FLOAT_MIN_WIDTH,LP_LOCATION_FLOAT_PRECISION,_lat);
+      dtostrf(gps_client.location.lng(),LP_LOCATION_FLOAT_MIN_WIDTH,LP_LOCATION_FLOAT_PRECISION,_lng);
+      _fix_age = gps_client.location.age();
     }
-  } else {
-    mqtt_client.loop();
-    DEBUG_SERIAL_COM.println("Valid GPS data received..."); 
 
-    _sats = gps_client.satellites.value();
-    _hdop = gps_client.hdop.hdop();
-    _lat = gps_client.location.lat();
-    _lng = gps_client.location.lng();
-    _dir = gps_client.course.deg();
-    _speed = gps_client.speed.kmph();
-    _alt = gps_client.altitude.meters();
-    _fix_age = gps_client.location.age();
-    _unix_timestamp =  get_unix_timestamp(&GPS_SERIAL_COM, &gps_client);
-    snprintf_P((char*)message, sizeof(message), PSTR("tracker_gps_telemetry,tracker_id=%s,vin=%s,fw_tag=%s,hw_conf_tag=%s "
-    "sats=%u,pdop=%s,hdop=%.2f,vdop=%s,lat=%2.6f,lng=%2.6f,dir=%hu,speed=%u,alt=%hu,fix_age=%hu %lu000000000"), TRACKER_ID,
-    VIN, FW_TAG, HW_CONF_TAG,_sats,pdop.value(),_hdop,vdop.value(),_lat,_lng,_dir,_speed,_alt,_fix_age,_unix_timestamp);
-    
-    DEBUG_SERIAL_COM.print("GPS data: ");DEBUG_SERIAL_COM.println((char*)message); 
-    
-    smartdelay(5000, &GPS_SERIAL_COM, &gps_client);
+    if(gps_client.date.isValid() && gps_client.date.age() < 1000 && gps_client.time.isValid() && gps_client.time.age() < 1000){
+      _unix_timestamp =  get_unix_timestamp(&GPS_SERIAL_COM, &gps_client);
+    }
+
+    if(gps_client.course.isValid() && gps_client.course.age() < 1000)
+      dtostrf(gps_client.course.deg(),LP_COURSE_FLOAT_MIN_WIDTH,LP_COURSE_FLOAT_PRECISION,_course);
+      
+    if(gps_client.speed.isValid() && gps_client.speed.age() < 1000)
+      dtostrf(gps_client.speed.kmph(),LP_SPEED_FLOAT_MIN_WIDTH,LP_SPEED_FLOAT_PRECISION,_speed);
+      
+    if(gps_client.altitude.isValid() && gps_client.altitude.age() < 1000)
+      dtostrf(gps_client.altitude.meters(),LP_ALTITUDE_FLOAT_MIN_WIDTH,LP_ALTITUDE_FLOAT_PRECISION,_alt);    
+
+    if(gps_client.hdop.isValid() && gps_client.hdop.age() < 1000)
+      dtostrf(gps_client.hdop.hdop(),LP_HDOP_FLOAT_MIN_WIDTH,LP_HDOP_FLOAT_PRECISION,_hdop);
+        
+    snprintf_P((char*)influx_lp, sizeof(influx_lp), PSTR("tracker_gps_telemetry,tracker_id=%s,vin=%s,fw_tag=%s,hw_conf_tag=%s sats=%u,pdop=%s,hdop=%s,vdop=%s,lat=%s,lng=%s,course=%s,speed=%s,alt=%s,fix_age=%lu %lu000000000"), 
+    TRACKER_ID, VIN, FW_TAG, HW_CONF_TAG, _sats, pdop.value(),_hdop,vdop.value(),_lat,_lng,_course,_speed,_alt,_fix_age,_unix_timestamp);
+    mqtt_client.publish("trackers", influx_lp);
+    DEBUG_SERIAL_COM.println((char*)influx_lp);
+    last_published_attempt = millis();
   }
-}
-
-
-void smartdelay(unsigned long ms, HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr){
-  unsigned long time_now = millis();
-  do 
-  {
-    while (gps_serial_com_ptr->available())
-      gps_client_ptr->encode(gps_serial_com_ptr->read());
-  } while (millis() - time_now < ms);
+  mqtt_client.loop();
 }
 
 void wait_for_valid_gps_data(HardwareSerial *gps_serial_com_ptr, TinyGPSPlus *gps_client_ptr){
@@ -162,28 +181,34 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.println();
 }
 
+void smartdelay(unsigned long ms, HardwareSerial* gps_serial_com_ptr, TinyGPSPlus* gps_client_ptr){
+  unsigned long time_now = millis();
+  do
+  {
+    while (gps_serial_com_ptr->available())
+      gps_client_ptr->encode(gps_serial_com_ptr->read());
+  } while (millis() - time_now < ms);
+}
+
 void reconnect() {  
   // Loop until we're reconnected
   while (!mqtt_client.connected()) {
-    DEBUG_SERIAL_COM.println("Attempting MQTT connection...");
-    // Attempt to connect
     if (mqtt_client.connect((const char*)device_id, "mqttclient", "Kf6F2LesMAdmkP2P")) {
-      DEBUG_SERIAL_COM.println("connected");
       //mqtt_client.subscribe("$SYS/broker/subscriptions/count");
     } else {
       DEBUG_SERIAL_COM.print("failed, rc=");
       DEBUG_SERIAL_COM.print(mqtt_client.state());
-      DEBUG_SERIAL_COM.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
+      DEBUG_SERIAL_COM.println(" try again in MQTT_CLIENT_RECONNECT_INTERVAL seconds");
+      // Wait before retrying
+      delay(MQTT_CLIENT_RECONNECT_INTERVAL);
     }
   }
 }
 
 void set_device_id(uint8_t *const _device_id, size_t size_device_id){
-  unsigned char *token;
-  at_engine.execute_at_command("AT+CGSN",100);
-  token = strtok((char*)at_engine.get_buffer_content(), "\r\n");
+  char *token;
+  at_engine.execute_at_command("AT+CGSN");
+  token = strtok((char*)at_engine.buf_content(), "\r\n");
   strncpy((char*)_device_id, (const char*)token, size_device_id);
 }
 
