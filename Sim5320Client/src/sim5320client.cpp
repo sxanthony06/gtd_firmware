@@ -12,35 +12,32 @@ Sim5320Client::~Sim5320Client(){
 }
 
 void Sim5320Client::init(void){  	
-	_at_engine->execute_at_command("AT+CPIN?", 100);
-	_pin_ready = strstr((const char*)_at_engine->get_buffer_content(), "READY") != NULL ? true : false;
+	_at_engine->execute_at_command("AT+CPIN?");
+	_pin_ready = strstr((const char*)_at_engine->buf_content(), "READY") != NULL ? true : false;
 	
 	stop();
-	close_net();
+	disconnect_from_gprs(500,10);
 	
-	_at_engine->execute_at_command("AT+CSQ", 100);		
+	_at_engine->execute_at_command("AT+CSQ");		
 	//this line is reserved for at cmd to check signal strength. make use of strtol to parse numeric response (CSQ)	
-	_at_engine->execute_at_command("AT+CGREG?", 100);
-
-	//_at_engine->execute_at_command("AT+CGDCONT=1,\"IP\",\"premium\",\"0.0.0.0\",0,0",100);
-
-	_at_engine->execute_at_command("AT+CIPRXGET=1", 100);
-	_at_engine->execute_at_command("AT+CIPENPSH=0", 100);
-	_at_engine->execute_at_command("AT+CIPSENDMODE=0", 100);
-	_at_engine->execute_at_command("AT+CIPCCFG=10,0,0,0,1,0,75000", 100);	
-	_at_engine->execute_at_command("AT+CIPTIMEOUT=75000,15000,15000", 100);	
+	_at_engine->execute_at_command("AT+CGREG?");
+	_netw_registered = strstr(_at_engine->buf_content(), "+CGREG: 0,1") != NULL ? true : false;
+	_at_engine->execute_at_command("AT+CIPRXGET=1");
+	_at_engine->execute_at_command("AT+CIPENPSH=0");
+	_at_engine->execute_at_command("AT+CIPSENDMODE=0");
+	_at_engine->execute_at_command("AT+CIPCCFG=3,0,0,0,1,0,10000");	// max 3 retransmission attempts and minimum timeout 10 seconds
+	//_at_engine->execute_at_command("AT+CIPTIMEOUT=75000,15000,15000");	
 	
-		
-	_at_engine->execute_at_command("AT+CGSOCKCONT=1,\"IP\", \"premium\"", 100);
-	_at_engine->execute_at_command("AT+CSOCKSETPN=1", 100);
+	_at_engine->execute_at_command("AT+CGSOCKCONT=1,\"IP\", \"premium\"");
+	_at_engine->execute_at_command("AT+CSOCKSETPN=1");
 	
 	//this line is reserved for at cmd to check is pdp context is set.	
 
-	_at_engine->execute_at_command("AT+CIPMODE=0", 100);
-	_at_engine->execute_at_command("AT+CIPSRIP=0", 100);  
-	_at_engine->execute_at_command("AT+CIPHEAD=1", 100);
+	_at_engine->execute_at_command("AT+CIPMODE=0");
+	_at_engine->execute_at_command("AT+CIPSRIP=0");  
+	_at_engine->execute_at_command("AT+CIPHEAD=0");
 	
-	open_net();
+	connect_to_gprs(1000,7);
 	this->_initialized = true;
 }
 
@@ -54,13 +51,17 @@ int Sim5320Client::connect(IPAddress ip, uint16_t port){
 int Sim5320Client::connect(const char* host, uint16_t port){
 	char custom_at_cmd[70] = {0};
 	
-	if(!is_net_open()){
-		if(!open_net())
+	if(!connected_to_gprs()){
+		if(!connect_to_gprs(500,10))
 			return 0;	
 	}
 	snprintf(custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%hu", host, port);
-	_at_engine->execute_at_command((const char*)custom_at_cmd, 5000);
-	return connected();
+	_at_engine->execute_at_command((const char*)custom_at_cmd);
+	for(uint8_t i = 0; i < ATTEMPTS_TO_FIND_CONNECT_RESPONSE; i++){
+		_at_engine->poll_for_async_response(500);
+		if(strstr((const char*)_at_engine->buf_content(), "+CIPOPEN:") != NULL)						
+			break;
+	}	
 }
 
 size_t Sim5320Client::write(uint8_t b){
@@ -69,20 +70,20 @@ size_t Sim5320Client::write(uint8_t b){
 
 size_t Sim5320Client::write(const uint8_t *buf, size_t s){
 	char custom_at_cmd[75] = {0};
-	size_t amount_bytes_written = 0;
-	
-	//Serial.print("amount of bytes to write: "); Serial.println(s);
+	size_t bytes_sent_gsm_module = 0;
 
 	snprintf(custom_at_cmd, sizeof(custom_at_cmd),"AT+CIPSEND=0,%hu", (uint16_t)s);
-	_at_engine->execute_at_command((const char*)custom_at_cmd, 100);
-	if(strstr((const char*)_at_engine->get_buffer_content(), ">") != NULL){
-		amount_bytes_written = _at_engine->pipe_raw_input(buf, s, 2000);
-
-		Serial.print("amount of bytes written: "); Serial.println(amount_bytes_written);
-		return amount_bytes_written;
-	}else {
-		return 0;
+	_at_engine->execute_at_command((const char*)custom_at_cmd);
+	if(strstr((const char*)_at_engine->buf_content(), ">") != NULL){
+		bytes_sent_gsm_module = _at_engine->pipe_raw_input(buf, s);
+		for(uint8_t i = 0; i < ATTEMPTS_TO_FIND_RAW_INPUT_RESPONSE; i++){
+			_at_engine->poll_for_async_response(500);
+			if(strstr((const char*)_at_engine->buf_content(), "+CIPSEND") != NULL)
+				break;						
+		}
 	}
+	//Serial.print("amount bytes written: ");Serial.println(bytes_sent_gsm_module);
+	return bytes_sent_gsm_module;
 }
 
 int Sim5320Client::available(){
@@ -90,8 +91,8 @@ int Sim5320Client::available(){
   char* stop;
   uint8_t buf[6];
   
-  _at_engine->execute_at_command("AT+CIPRXGET=4,0", 100);
-  const char* const response = (const char*)_at_engine->get_buffer_content();
+  _at_engine->execute_at_command("AT+CIPRXGET=4,0");
+  const char* const response = (const char*)_at_engine->buf_content();
   start = strrchr(response, ',');
   if(start != NULL){
      stop = strchr(start, 13);
@@ -128,20 +129,13 @@ int Sim5320Client::read(uint8_t *buf, size_t size){
 		return -1;
 	
 	snprintf((char*)custom_at_cmd, sizeof(custom_at_cmd), "AT+CIPRXGET=2,0,%d", (int8_t)amount_chars_available);
-	_at_engine->execute_at_command((const char*)custom_at_cmd, 100);
-	const char* const response = (const char*)_at_engine->get_buffer_content();			 
+	_at_engine->execute_at_command((const char*)custom_at_cmd);
+	const char* const response = (const char*)_at_engine->buf_content();			 
 	substr = strtok((char*)response,"\r\n");
 	substr = strtok((char*)NULL,"\r\n");
 	
 	// Null must be allowed to be saved in buf since MQTT does make use of 0 or NULL inside its headers e.g CONNACK. See MQTT v. 3.1.1 specification.
 	memcpy((uint8_t*)buf, (const char*)substr, amount_chars_available);
-	/* start debug code...
-	Serial.println("debugging connack");
-	for(int i = 0; i < amount_chars_available; i++){
-		Serial.print("byte: "); Serial.print(buf[i], HEX); Serial.print(" or "); Serial.print(buf[i], BIN);
-	}
-	Serial.println();
-	// end debug code... */
 	return amount_chars_available;
 }
 
@@ -154,45 +148,54 @@ void Sim5320Client::flush(){
 void Sim5320Client::stop(){
 	if(connected()){
 		while(1){
-		  _at_engine->execute_at_command("AT+CIPCLOSE=0", 3000);
+		  _at_engine->execute_at_command("AT+CIPCLOSE=0");
 		  if(!connected()) break;
-		  delay(1000);
+		  delay(500);
 		}
 	}
-/*	if(is_net_open()){
-		while(1){
-		  _at_engine->execute_at_command("AT+NETCLOSE", 2000);
-		  if(!is_net_open()) break;
-		  delay(1000);
-		}
-	}	*/
 }
 
 uint8_t Sim5320Client::connected(){
-	_at_engine->execute_at_command("AT+CIPOPEN?", 1000);
-	return strstr((const char*)_at_engine->get_buffer_content(), "TCP") != NULL ? 1 : 0;
+	char * token;
+	bool connected = false;
+	
+	_at_engine->execute_at_command("AT+CIPCLOSE?");
+	//return strstr((const char*)_at_engine->buf_content(), "TCP") != NULL ? 1 : 0;
+	token = strtok((char*)_at_engine->buf_content(), ",");
+   	return (atoi(token+(strlen(token)-1)) == 1);
+}
+
+bool Sim5320Client::connected_to_gprs(){
+  	_at_engine->execute_at_command("AT+NETOPEN?");
+  	
+	return strstr((const char*)_at_engine->buf_content(), "+NETOPEN: 1,") != NULL;
+}
+
+bool Sim5320Client::connect_to_gprs(uint16_t wait_time, uint8_t attempts){
+	if(connected_to_gprs())
+		return true;
+	_at_engine->execute_at_command("AT+NETOPEN");
+	for(uint8_t i = 0; i < attempts; i++){
+		_at_engine->poll_for_async_response(wait_time);	
+		if(connected_to_gprs())
+			return true;
+		_at_engine->poll_for_async_response(wait_time);	
+	}
+	return false;
 
 }
 
-uint8_t Sim5320Client::is_net_open(){
-  	_at_engine->execute_at_command("AT+NETOPEN?", 100);
-	return strstr((const char*)_at_engine->get_buffer_content(), "+NETOPEN: 1,") != NULL;
-}
-
-uint8_t Sim5320Client::open_net(){
-	if(is_net_open())
-		return 1;
-	_at_engine->execute_at_command("AT+NETOPEN", 5000);
-	return strstr((const char*)_at_engine->get_buffer_content(), "+NETOPEN: 1,") != NULL;
-
-}
-
-uint8_t Sim5320Client::close_net(){
-	if(is_net_open()){
-		_at_engine->execute_at_command("AT+NETCLOSE", 6000);
-		return strstr((const char*)_at_engine->get_buffer_content(), "+NETOPEN: 0,") != NULL;
+bool Sim5320Client::disconnect_from_gprs(uint16_t wait_time, uint8_t attempts){
+	if(connected_to_gprs()){
+		_at_engine->execute_at_command("AT+NETCLOSE");
+		for(uint8_t i = 0; i < attempts; i++){
+			_at_engine->poll_for_async_response(wait_time);	
+			if(strstr((const char*)_at_engine->buf_content(), "+NETOPEN: 0,") != NULL);
+				return true;
+		}
+		return false;
 	}else{
-		return 1;
+		return true;
 	}
 }
 
