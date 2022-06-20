@@ -1,3 +1,12 @@
+# Visual Studio user and workspace directories
+.vscode
+
+# Compressed files
+*.zip
+*.rar
+
+############################################################################################################
+
 *~
 
 # temporary files which can be created if a process still has a handle open of a deleted file
@@ -11,6 +20,8 @@
 
 # .nfs files are created when an open file is removed but is still being accessed
 .nfs*
+
+############################################################################################################
 
 # Prerequisites
 *.d
